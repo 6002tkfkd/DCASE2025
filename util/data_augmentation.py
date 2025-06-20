@@ -17,15 +17,23 @@ class MixUp(_DataAugmentation):
         self.alpha = alpha
         self.lam = 1
 
-    def forward(self, x, y):
-        self.lam = np.random.beta(self.alpha, self.alpha)
-        batch_size = x.size()[0]
-        index = torch.randperm(batch_size).to(x.device)
+    def forward(self, x, y, y_soft=None):
+        indices = torch.randperm(x.size(0)).to(x.device)
+        x2 = x[indices]
+        y2 = y[indices]
+        x_mix = self.lam * x + (1 - self.lam) * x2
 
-        x = self.lam * x + (1 - self.lam) * x[index, :]
-        y_a, y_b = y, y[index]
-        x, y_a, y_b = map(Variable, (x, y_a, y_b))
-        return x, (y_a, y_b)
+        if isinstance(y, tuple):  # 이미 mix 된 상태인 경우
+            y_mix = y
+        else:
+            y_mix = (y, y2)
+
+        if y_soft is not None:
+            y_soft2 = y_soft[indices]
+            y_soft_mix = (y_soft, y_soft2)
+            return x_mix, y_mix, y_soft_mix
+        else:
+            return x_mix, y_mix
 
 class SoftMixUp(_DataAugmentation):
     def __init__(self, alpha=0.3):

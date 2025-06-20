@@ -212,9 +212,9 @@ class DeviceFilter(nn.Module):
         if device_name is None:
             device_idx = torch.full((B,), self.default_device_idx, dtype=torch.long, device=x.device)
         else:
-            device_idx = [self.device_to_idx.get(name, self.default_device_idx) for name in device_name]
-            device_idx = torch.tensor(device_idx, dtype=torch.long, device=x.device)
-
+            # device_idx = [self.device_to_idx.get(name, self.default_device_idx) for name in device_name]
+            # device_idx = torch.tensor(device_idx, dtype=torch.long, device=x.device)
+            device_idx = torch.tensor(device_name, dtype=torch.long, device=x.device)
         # (B, embed_dim)
         embed_vec = self.embedding(device_idx)
 

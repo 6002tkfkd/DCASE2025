@@ -1,0 +1,114 @@
+### Train TF-SepNet (with knowledge distillation) ###
+
+trainer:
+  logger:
+      class_path: lightning.pytorch.loggers.TensorBoardLogger
+      init_args:
+        save_dir: log
+        name: tfsepnet_kd
+  callbacks:
+    - class_path: util.OverrideEpochStepCallback
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: epoch
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        save_top_k: 1
+        monitor: val_acc
+        mode: max
+        filename: '{epoch}-{val_acc:.4f}'
+
+  max_epochs: 150
+
+ckpt_path: null
+
+model:
+  class_path: model.lit_asc.LitAscWithKnowledgeDistillation
+  init_args:
+    backbone:
+      class_path: model.backbones.TFSepNet
+      init_args:
+        in_channels: 1
+        num_classes: 10
+        base_channels: 64
+        depth: 17
+    # Set to ``null`` if not applied
+    data_augmentation:
+      mix_up:
+        class_path: util.MixUp
+        init_args:
+          alpha: 0.3
+      mix_style:
+        class_path: util.FreqMixStyle
+        init_args:
+          alpha: 0.4
+          p: 0.8
+      spec_aug:
+        class_path: util.SpecAugmentation
+        init_args:
+          mask_size: 0.2
+          p: 1.0
+      filt_aug:
+        class_path: util.FilterAugmentation
+        init_args:
+          filter_type: "step"
+          db_range: [-4, 4]
+      add_noise:
+        class_path: util.AdditiveNoiseAugmentation
+        init_args:
+          snrs: [10, 20]
+      freq_mask:
+        class_path: util.FrequencyMaskAugmentation
+        init_args:
+          mask_ratio: 16
+      time_mask:
+        class_path: util.TimeMaskAugmentation
+        init_args:
+          mask_ratios: [10, 20]
+          net_pooling: 2
+      frame_shift:
+        class_path: util.FrameShiftAugmentation
+        init_args:
+          net_pooling: 2
+      dir_aug:
+        class_path: util.DeviceImpulseResponseAugmentation
+        init_args:
+          path_ir: /home/work/dcase2025/micIR
+          p: 0.4
+    class_label: scene
+    domain_label: device
+    spec_extractor:
+      class_path: util.CpMel
+      init_args:
+        n_mels: 512
+    device_list: ["a", "b", "c", "s1", "s2", "s3", "s4", "s5", "s6", "unknown"]
+    device_unknown_prob: 0.1  
+    temperature: 2.0
+    kd_lambda: 0.02
+
+data:
+  # Wrapped data module of train, valid, test DataLoaders
+  class_path: data.data_module.DCASEDataModule
+  init_args:
+    meta_dir: /home/work/test/meta_dcase_2025
+    audio_dir: /home/work/dcase2025/TAU-urban-acoustic-scenes-2022-mobile-development
+    batch_size: 256
+    num_workers: 12
+    pin_memory: true
+    sampling_rate: 32000
+    train_subset: split25
+    # Path to teacher logits. If use more than one logit, the logits will be averaged as teacher ensemble.
+    logits_files:
+      - /home/work/test/teacher_models/up_0.55_m0.8/predictions_split25.pt
+      - /home/work/test/teacher_models/efficientat_version56/predictions_split25.pt
+
+      
+optimizer:
+  class_path: torch.optim.Adam
+  init_args:
+    lr: 0.004
+lr_scheduler:
+  class_path: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts
+  init_args:
+    T_0: 10
+    T_mult: 2

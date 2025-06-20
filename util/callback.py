@@ -2,9 +2,11 @@ import os
 import lightning.pytorch as pl
 import torch
 from lightning.pytorch.callbacks import BasePredictionWriter
-from neural_compressor.config import PostTrainingQuantConfig, TuningCriterion, AccuracyCriterion
-from neural_compressor.quantization import fit
+import torch.nn.functional as F
+# from neural_compressor.config import PostTrainingQuantConfig, TuningCriterion, AccuracyCriterion
+# from neural_compressor.quantization import fit
 from model.shared import ResNorm
+import csv
 
 
 class OverrideEpochStepCallback(pl.callbacks.Callback):
@@ -118,9 +120,24 @@ class PostTrainingQuantization(pl.callbacks.Callback):
                 accuracy, _ = cal_accuracy(y_hat_all, y_all)
             return accuracy
         # Exclude the ResNorm layer
-        prepare_custom_config_dict = {"non_traceable_module_class": [ResNorm]}
-        q_model = fit(model=model, conf=conf, calib_func=eval_func, eval_func=eval_func,
-                      prepare_custom_config_dict=prepare_custom_config_dict)
-        # Save the quantized model to the original directory of trained model
-        q_model.save(f"{trainer.log_dir}/quantized_model/")
-        quit()
+        # prepare_custom_config_dict = {"non_traceable_module_class": [ResNorm]}
+        # q_model = fit(model=model, conf=conf, calib_func=eval_func, eval_func=eval_func,
+        #               prepare_custom_config_dict=prepare_custom_config_dict)
+        # # Save the quantized model to the original directory of trained model
+        # q_model.save(f"{trainer.log_dir}/quantized_model/")
+        # quit()
+
+class SubmissionPredictionWriter(BasePredictionWriter):
+    def __init__(self, output_csv, class_names, write_interval="epoch"):
+        super().__init__(write_interval=write_interval)
+        self.output_csv = output_csv
+        self.class_names = class_names
+
+    def write_on_epoch_end(self, trainer, pl_module, predictions, batch_indices):
+        os.makedirs(os.path.dirname(self.output_csv), exist_ok=True)
+        with open(self.output_csv, 'w', newline='') as f:
+            writer = csv.writer(f, delimiter='\t')
+            writer.writerow(['filename', 'scene_label'] + self.class_names)
+            for batch in predictions:
+                for sample in batch:
+                    writer.writerow([sample['filename'], sample['scene_label']] + sample['probs'])

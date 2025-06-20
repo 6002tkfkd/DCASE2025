@@ -1,0 +1,44 @@
+### Test TF-SepNet ###
+
+trainer:
+  logger:
+    class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: log
+      name: tfsepnet_test_specific
+
+ckpt_path: /home/work/test/dcase25_kd/log/tfsepnet_kd/version_2/checkpoints/epoch=146-val_acc=0.5097.ckpt  # Path to the checkpoint file
+model:
+  class_path: model.lit_asc.LitAcousticSceneClassificationSystem
+  init_args:
+    backbone:
+      class_path: model.backbones.TFSepNet
+      init_args:
+        in_channels: 1
+        num_classes: 10
+        base_channels: 64
+        depth: 17
+    data_augmentation:
+      mix_up: null
+      mix_style: null
+      spec_aug: null
+      dir_aug: null
+    class_label: scene
+    domain_label: device
+    spec_extractor:
+      class_path: util.CpMel
+      init_args:
+        n_mels: 512
+    device_list: ["a", "b", "c", "s1", "s2", "s3", "s4", "s5", "s6", "unknown"]
+    device_unknown_prob: 0.0
+
+data:
+  class_path: data.data_module.DCASEDataModule
+  init_args:
+    meta_dir: /home/work/test/meta_dcase_2025
+    audio_dir: /home/work/dcase2025/TAU-urban-acoustic-scenes-2022-mobile-development
+    batch_size: 256
+    num_workers: 16
+    pin_memory: true
+    sampling_rate: 32000
+    test_subset: test

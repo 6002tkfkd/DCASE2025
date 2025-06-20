@@ -7,23 +7,16 @@ from lightning.pytorch.cli import OptimizerCallable, LRSchedulerCallable
 from model.backbones import _BaseBackbone
 from util.lr_scheduler import exp_warmup_linear_down
 from util import _SpecExtractor, ClassificationSummary, _DataAugmentation
+import pandas as pd
+from collections import defaultdict
+import numpy as np
+from util import unique_labels
+from sklearn.metrics import log_loss
 from model.shared import DeviceFilter
 
 
+
 class LitAcousticSceneClassificationSystem(L.LightningModule):
-    """
-    Acoustic Scene Classification system based on LightningModule.
-    Backbone model, data augmentation techniques and spectrogram extractor are designed to be plug-and-played.
-    Backbone architecture, system complexity, classification report and confusion matrix are shown at test stage.
-
-    Args:
-        backbone (_BaseBackbone): Deep neural network backbone, e.g. cnn, transformer...
-        data_augmentation (dict): A dictionary containing instances of data augmentation techniques in util/. Options: MixUp, FreqMixStyle, DeviceImpulseResponseAugmentation, SpecAugmentation. Set each to ``None`` if not use one of them.
-        class_label (str): Class label. e.g. scene, device, city.
-        domain_label (str): Domain label. e.g. scene, device, city.
-        spec_extractor (_SpecExtractor): Spectrogram extractor used to transform 1D waveforms to 2D spectrogram. If ``None``, the input features should be 2D spectrogram.
-    """
-
     def __init__(self,
                  backbone: _BaseBackbone,
                  data_augmentation: Dict[str, Optional[_DataAugmentation]],
@@ -32,8 +25,7 @@ class LitAcousticSceneClassificationSystem(L.LightningModule):
                  spec_extractor: _SpecExtractor = None,
                  device_list: list[str] = None,
                  device_unknown_prob: float = 0.1):
-        super(LitAcousticSceneClassificationSystem, self).__init__()
-        # Save the hyperparameters for Tensorboard visualization, 'backbone' and 'spec_extractor' are excluded.
+        super().__init__()
         self.save_hyperparameters(ignore=['backbone', 'spec_extractor'])
         self.backbone = backbone
         self.data_aug = data_augmentation
@@ -41,16 +33,27 @@ class LitAcousticSceneClassificationSystem(L.LightningModule):
         self.domain_label = domain_label
         self.cla_summary = ClassificationSummary(class_label, domain_label)
         self.spec_extractor = spec_extractor
+        self._test_step_outputs = {'emb': [], 'y': [], 'pred': [], 'd': [], 'logits': [], 'loss': []}
+        self._test_input_size = None
+
+        self.idx_to_label = {
+            0: "airport",
+            1: "bus",
+            2: "metro",
+            3: "metro_station",
+            4: "park",
+            5: "public_square",
+            6: "shopping_mall",
+            7: "street_pedestrian",
+            8: "street_traffic",
+            9: "tram"
+        }
+
+        self.device_unknown_prob = device_unknown_prob
         if device_list is not None:
-            self.device_filter = DeviceFilter(device_list, input_channels = 1)
+            self.device_filter = DeviceFilter(device_list, input_channels=1)
         else:
             self.device_filter = None
-
-        # Save data during testing for statistical analysis
-        self._test_step_outputs = {'emb': [], 'y': [], 'pred': [], 'd': []}
-        # Input size of a 4D sample (1, 1, F, T), used for generating model profile.
-        self._test_input_size = None
-        self.device_unknown_prob = device_unknown_prob
 
     @staticmethod
     def accuracy(logits, labels):
@@ -58,16 +61,35 @@ class LitAcousticSceneClassificationSystem(L.LightningModule):
         acc = torch.sum(pred == labels).item() / len(labels)
         return acc, pred
 
-    def apply_device_filter(self, x, device_names: list[str]):
+    def apply_device_filter(self, x, device_names: list):
         if self.device_filter is None:
             return x
 
-        if self.training and self.device_unknown_prob > 0:
-            device_names = [
-                name if torch.rand(1).item() > self.device_unknown_prob else "unknown"
-                for name in device_names
-            ]
-        return self.device_filter(x, device_names)
+        # 문자열 → index 변환
+        if isinstance(device_names[0], str):
+            if self.training and self.device_unknown_prob > 0:
+                device_idxs = [
+                    self.device_filter.device_to_idx.get(name, self.device_filter.default_device_idx)
+                    if torch.rand(1).item() > self.device_unknown_prob
+                    else self.device_filter.default_device_idx
+                    for name in device_names
+                ]
+            else:
+                device_idxs = [
+                    self.device_filter.device_to_idx.get(name, self.device_filter.default_device_idx)
+                    for name in device_names
+                ]
+        else:
+            # 이미 int index이면 그대로 사용
+            device_idxs = device_names
+
+        print(f"[DeviceFilter] input device_names: {device_names}")
+        print(f"[DeviceFilter] mapped device_idxs: {device_idxs}")
+
+        device_tensor = torch.tensor(device_idxs, dtype=torch.long, device=x.device)
+        return self.device_filter(x, device_tensor)
+
+
 
     def forward(self, x):
         return self.backbone(x)
@@ -93,7 +115,6 @@ class LitAcousticSceneClassificationSystem(L.LightningModule):
 
         x = dir_aug(x, labels['device']) if dir_aug is not None else x # Apply dir augmentation on waveform
         x = self.spec_extractor(x).unsqueeze(1) if self.spec_extractor is not None else x.unsqueeze(1) # Extract spectrogram from waveform
-        x = self.apply_device_filter(x, labels['device']) # Apply other augmentations on spectrogram
 
         x = mix_style(x) if mix_style is not None else x
         x = spec_aug(x) if spec_aug is not None else x
@@ -106,7 +127,9 @@ class LitAcousticSceneClassificationSystem(L.LightningModule):
         x = time_mask_aug(x) if time_mask_aug is not None else x
         x = frame_shift_aug(x) if frame_shift_aug is not None else x
 
+        x = self.apply_device_filter(x, labels['device'])
         y_hat = self(x)
+        
         # Calculate the loss and accuracy
         if mix_up is not None:
             pred = torch.argmax(y_hat, dim=1)
@@ -128,62 +151,143 @@ class LitAcousticSceneClassificationSystem(L.LightningModule):
         y = labels[self.class_label]
         x = self.spec_extractor(x).unsqueeze(1) if self.spec_extractor is not None else x.unsqueeze(1)
         x = self.apply_device_filter(x, labels['device'])
-
+        
         y_hat = self(x)
         val_loss = F.cross_entropy(y_hat, y)
         val_acc, _ = self.accuracy(y_hat, y)
         self.log_dict({'val_loss': val_loss, 'val_acc': val_acc}, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log("epoch", self.current_epoch, on_epoch=True, prog_bar=False, logger=True)
+        # Lightning이 epoch을 자동으로 기록하지 않으므로 수동으로 기록, 즉 epoch이라는게 있는지도 모른다.
+        # Lighting이 epoch라는 이름의 metric을 실제로 log로 남기고 있어야 하기 때문에
+        # epoch이라는 값의 변화를 추적해서 저장여부를 판단하겠다는 의미 yaml의 monitor : epoch
+        # epoch을 볼 수 있게 수치화 해버린 것 ex) loss, acc, epoch
         return val_acc
+
+
+
 
     def test_step(self, batch, batch_idx):
         x = batch[0]
         labels = {'scene': batch[1], 'device': batch[2], 'city': batch[3]}
         y = labels[self.class_label]
         d = labels[self.domain_label]
+
         x = self.spec_extractor(x).unsqueeze(1) if self.spec_extractor is not None else x.unsqueeze(1)
-        # Get the input size of feature for measuring model profile
+
+        # device specific log_loss, acc
+        # x = self.apply_device_filter(x, labels['device'])
+
+        # general log_loss, acc
+        devices_label = torch.full((x.size(0),), 9, dtype=torch.int64)  # 모든 데이터에 대해 device 필터링을 적용
+        x = self.apply_device_filter(x, devices_label)  # 모든 데이터에 대해 device 필터링을 적용
+
         self._test_input_size = (1, 1, x.size(-2), x.size(-1))
+        
         y_hat = self(x)
         test_loss = F.cross_entropy(y_hat, y)
         test_acc, pred = self.accuracy(y_hat, y)
+        
         self.log_dict({'test_loss': test_loss, 'test_acc': test_acc})
 
         self._test_step_outputs['y'] += y.cpu().numpy().tolist()
         self._test_step_outputs['pred'] += pred.cpu().numpy().tolist()
         self._test_step_outputs['d'] += d.cpu().numpy().tolist()
+        self._test_step_outputs['logits'] += y_hat.detach().cpu().numpy().tolist()
+        self._test_step_outputs['loss'] += [test_loss.item()]
         return test_acc
 
+
+
     def on_test_epoch_end(self):
+
         tensorboard = self.logger.experiment
-        # Summary the model profile
+
+        # --- 모델 프로파일 출력 ---
         print("\n Model Profile:")
         model_profile = torchinfo.summary(self.backbone, input_size=self._test_input_size)
         macc = model_profile.total_mult_adds
         params = model_profile.total_params
         print('MACC:\t \t %.6f' % (macc / 1e6), 'M')
         print('Params:\t \t %.3f' % (params / 1e3), 'K\n')
-        # Convert the summary to string
+
         model_summary = str(model_profile)
         model_summary += f'\n MACC:\t \t {macc / 1e6:.3f}M'
         model_summary += f'\n Params:\t \t {params / 1e3:.3f}K\n'
         model_summary = model_summary.replace('\n', '<br/>').replace(' ', '&nbsp;').replace('\t', '&emsp;')
         tensorboard.add_text('model_summary', model_summary)
-        # Generate a classification report table
+
+        # --- 분류 리포트 및 confusion matrix ---
         tab_report = self.cla_summary.get_table_report(self._test_step_outputs)
         tensorboard.add_text('classification_report', tab_report)
-        # Generate an confusion matrix figure
+
         cm = self.cla_summary.get_confusion_matrix(self._test_step_outputs)
         tensorboard.add_figure('confusion_matrix', cm)
 
-    def predict_step(self, batch):
+        # --- Accuracy / LogLoss 계산 ---
+        pred = np.array(self._test_step_outputs['pred'])
+        label = np.array(self._test_step_outputs['y'])
+        device = np.array(self._test_step_outputs['d'])
+        logits = np.array(self._test_step_outputs['logits'])
+        probs = torch.softmax(torch.tensor(logits), dim=1).numpy()
+
+        classes = list(range(probs.shape[1]))
+        devices_list = np.unique(device)
+
+        print("\nClass-wise Accuracy and LogLoss:")
+        for class_idx in classes:
+            idx = np.where(label == class_idx)[0]
+            if len(idx) == 0: continue
+            acc = np.mean((np.argmax(probs[idx], axis=1) == label[idx]))
+            ll = log_loss(label[idx], probs[idx], labels=classes)
+            class_name = unique_labels["scene"][class_idx]
+            print(f"  {class_name:20s} : acc={acc:.4f}, logloss={ll:.4f}")
+
+        print("\nDevice-wise Accuracy and LogLoss:")
+        for d in devices_list:
+            idx = np.where(device == d)[0]
+            if len(idx) == 0: continue
+            acc = np.mean((np.argmax(probs[idx], axis=1) == label[idx]))
+            ll = log_loss(label[idx], probs[idx], labels=classes)
+            device_name = unique_labels["device"][d]
+            print(f"  {device_name:10s} : acc={acc:.4f}, logloss={ll:.4f}")
+
+        # --- 평균 log loss ---
+        losses = np.array(self._test_step_outputs['loss'])
+        avg_logloss = losses.mean()
+        print(f"\nAverage LogLoss: {avg_logloss:.4f}")
+        self.log("test_logloss", avg_logloss)
+        tensorboard.add_scalar("LogLoss/test", avg_logloss, self.current_epoch)
+
+    def predict_step(self, batch, batch_idx):
         x = batch[0]
+        filenames = batch[1]  # 리스트: batch size 만큼의 파일 이름
+
         x = self.spec_extractor(x).unsqueeze(1) if self.spec_extractor is not None else x.unsqueeze(1)
-        return self(x)
+
+        # ⛏️ 여기서 각 파일명에서 디바이스 추출
+        devices = [fn.split('-')[-1].split('.')[0] for fn in filenames]  # ex) ['a', 'b', 'c', ...]
+        x = self.apply_device_filter(x, devices)
+
+        y_hat = self(x)  # [B, num_classes]
+        probs = torch.softmax(y_hat, dim=1)  # 확률값으로 변환
+        preds = torch.argmax(probs, dim=1)
+
+        return [
+            {
+                'filename': filename,
+                'scene_label': self.idx_to_label[pred.item()],
+                'probs': prob.tolist()
+            }
+            for filename, pred, prob in zip(filenames, preds, probs)
+        ]
+
+
+
 
 
 class LitAscWithKnowledgeDistillation(LitAcousticSceneClassificationSystem):
     """
-    ASC system with knowledge distillation.
+    ASC system with knowledge distillation using Top-2 margin-based teacher weighting.
 
     Args:
         temperature (float): A higher temperature indicates a softer distribution of pseudo-probabilities.
@@ -195,54 +299,94 @@ class LitAscWithKnowledgeDistillation(LitAcousticSceneClassificationSystem):
         self.temperature = temperature
         self.kd_lambda = kd_lambda
         self.logits_index = logits_index
-        # KL Divergence loss for soft targets
-        self.kl_div_loss = torch.nn.KLDivLoss(log_target=True)
+        self.kl_div_loss = torch.nn.KLDivLoss(log_target=True, reduction='batchmean')
+        # self.kl_div_loss = torch.nn.KLDivLoss(log_target=True)
 
     def training_step(self, batch, batch_idx):
         x = batch[0]
-        # Store label dices in a dict
         labels = {'scene': batch[1], 'device': batch[2], 'city': batch[3]}
-        # Load soft labels
-        teacher_logits = batch[self.logits_index]
-        y_soft = F.log_softmax(teacher_logits / self.temperature, dim=-1)
-        # Load hard labels
         y = labels[self.class_label]
-        # Instantiate data augmentations
-        dir_aug = self.data_aug['dir_aug']
-        mix_style = self.data_aug['mix_style']
-        spec_aug = self.data_aug['spec_aug']
-        mix_up = self.data_aug['mix_up']
-        # Apply dir augmentation on waveform
-        x = dir_aug(x, labels['device']) if dir_aug is not None else x
-        # Extract spectrogram from waveform
+
+        logits_list = batch[4]  # teachers가 예측한 logits list 각 원소는 [N, C] 형태
+
+        # --- Margin-based weighting ---
+        probs_list = [torch.softmax(logits, dim=1) for logits in logits_list]  # [T, N, C]
+        margins = [torch.topk(p, k=2, dim=1).values[:, 0] - torch.topk(p, k=2, dim=1).values[:, 1] for p in probs_list]  # [T, N]
+        score_stack = torch.stack(margins, dim=1)  # [N, T]
+        norm_weights = score_stack / (score_stack.sum(dim=1, keepdim=True) + 1e-6)  # [N, T]
+
+        logits_stack = torch.stack(logits_list, dim=1)  # [N, T, C]
+        weights_expanded = norm_weights.unsqueeze(2)  # [N, T, 1]
+        teacher_logits = (logits_stack * weights_expanded).sum(dim=1)  # [N, C]
+
+        y_soft = F.log_softmax(teacher_logits / self.temperature, dim=-1)
+
+        # --- Data augmentation ---
+        aug = self.data_aug
+
+        # dir_aug on waveform
+        if aug.get('dir_aug') is not None:
+            x = aug['dir_aug'](x, labels['device'])
+
+        # Spectrogram
         x = self.spec_extractor(x).unsqueeze(1) if self.spec_extractor is not None else x.unsqueeze(1)
-        # Apply other augmentations on spectrogram
-        x = mix_style(x) if mix_style is not None else x
-        x = spec_aug(x) if spec_aug is not None else x
-        if mix_up is not None:
-            x, y, y_soft = mix_up(x, y, y_soft)
-        # Get the predicted labels
+
+        # Other augmentations on spectrogram
+        for key in ['mix_style', 'spec_aug', 'filt_aug', 'add_noise', 'freq_mask', 'time_mask', 'frame_shift']:
+            if aug.get(key) is not None:
+                x = aug[key](x)
+
+        # MixUp
+        if aug.get('mix_up') is not None:
+            x, y, y_soft = aug['mix_up'](x, y, y_soft)
+
+        # Forward
         y_hat = self(x)
-        # Temperature adjusted probabilities of teacher and student
         with torch.cuda.amp.autocast():
             y_hat_soft = F.log_softmax(y_hat / self.temperature, dim=-1)
-        # Calculate the loss and accuracy
-        if mix_up is not None:
-            label_loss = mix_up.lam * F.cross_entropy(y_hat, y[0]) + (1 - mix_up.lam) * F.cross_entropy(y_hat, y[1])
-            kd_loss = mix_up.lam * self.kl_div_loss(y_hat_soft, y_soft[0]) + (1 - mix_up.lam) * self.kl_div_loss(y_hat_soft, y_soft[1])
+
+        # Loss
+        if aug.get('mix_up') is not None:
+            label_loss = aug['mix_up'].lam * F.cross_entropy(y_hat, y[0]) + (1 - aug['mix_up'].lam) * F.cross_entropy(y_hat, y[1])
+            kd_loss = aug['mix_up'].lam * self.kl_div_loss(y_hat_soft, y_soft[0]) + (1 - aug['mix_up'].lam) * self.kl_div_loss(y_hat_soft, y_soft[1])
         else:
             label_loss = F.cross_entropy(y_hat, y)
             kd_loss = self.kl_div_loss(y_hat_soft, y_soft)
+
         kd_loss = kd_loss * (self.temperature ** 2)
         loss = self.kd_lambda * label_loss + (1 - self.kd_lambda) * kd_loss
-        self.log_dict({'loss': loss, 'label_loss': label_loss, 'kd_loss': kd_loss}, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+        # --- Logging ---
+        avg_weights = norm_weights.mean(dim=0)  # [T]
+        for i, avg_w in enumerate(avg_weights):
+            self.log(f"t{i+1}_avg_w", avg_w.item(), on_step=False, on_epoch=True, prog_bar=True)
+            self.logger.experiment.add_histogram(f"train/teacher{i+1}_weights", norm_weights[:, i], global_step=self.current_epoch)
+
+        y_for_logging = y[0] if isinstance(y, tuple) else y
+        num_classes = torch.max(y_for_logging).item() + 1
+        for c in range(num_classes):
+            mask = (y_for_logging == c)
+            if mask.sum() > 0:
+                for t in range(norm_weights.shape[1]):
+                    avg_w_c = norm_weights[mask, t].mean().item()
+                    self.logger.experiment.add_scalar(f"classwise_teacher{t+1}_weight/class_{c}", avg_w_c, self.current_epoch)
+                    self.logger.experiment.add_scalar(f"class_{c}/teacher{t+1}_weight", avg_w_c, self.current_epoch)
+                top_teacher_idx = torch.argmax(norm_weights[mask].mean(dim=0)).item()
+                self.logger.experiment.add_scalar(f"classwise_top_teacher_idx/class_{c}", top_teacher_idx, self.current_epoch)
+
+        self.log_dict({
+            'loss': loss,
+            'label_loss': label_loss,
+            'kd_loss': kd_loss,
+        }, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
         return loss
 
 
+
+        
+# No changes required for the scheduler subclasses
 class LitAscWithWarmupLinearDownScheduler(LitAcousticSceneClassificationSystem):
-    """
-    ASC system with warmup-linear-down scheduler.
-    """
     def __init__(self, optimizer: OptimizerCallable, warmup_len=4, down_len=26, min_lr=0.005, **kwargs):
         super(LitAscWithWarmupLinearDownScheduler, self).__init__(**kwargs)
         self.optimizer = optimizer
@@ -258,12 +402,6 @@ class LitAscWithWarmupLinearDownScheduler(LitAcousticSceneClassificationSystem):
 
 
 class LitAscWithTwoSchedulers(LitAcousticSceneClassificationSystem):
-    """
-    ASC system with two customized schedulers.
-
-    Directly instantiate multiple schedulers from the yaml config file.
-    For more details: https://lightning.ai/docs/pytorch/stable/cli/lightning_cli_advanced_3.html
-    """
     def __init__(self, optimizer: OptimizerCallable, scheduler1: LRSchedulerCallable, scheduler2: LRSchedulerCallable, milestones, **kwargs):
         super(LitAscWithTwoSchedulers, self).__init__(**kwargs)
         self.optimizer = optimizer
@@ -280,12 +418,6 @@ class LitAscWithTwoSchedulers(LitAcousticSceneClassificationSystem):
 
 
 class LitAscWithThreeSchedulers(LitAcousticSceneClassificationSystem):
-    """
-    ASC system with three customized schedulers.
-
-    Directly instantiate multiple schedulers from the yaml config file.
-    For more details: https://lightning.ai/docs/pytorch/stable/cli/lightning_cli_advanced_3.html
-    """
     def __init__(self, optimizer: OptimizerCallable, scheduler1: LRSchedulerCallable, scheduler2: LRSchedulerCallable, scheduler3: LRSchedulerCallable, milestones, **kwargs):
         super(LitAscWithThreeSchedulers, self).__init__(**kwargs)
         self.optimizer = optimizer
@@ -301,4 +433,3 @@ class LitAscWithThreeSchedulers(LitAcousticSceneClassificationSystem):
         scheduler3 = self.scheduler3(optimizer)
         scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [scheduler1, scheduler2, scheduler3], self.milestones)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
-

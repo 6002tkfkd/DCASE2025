@@ -1,0 +1,62 @@
+trainer:
+  callbacks:
+    - class_path: util.callback.SubmissionPredictionWriter
+      init_args:
+        output_csv: /home/work/test/log/Test_TAU_task1_1.output.csv
+        class_names:
+          - airport
+          - bus
+          - metro
+          - metro_station
+          - park
+          - public_square
+          - shopping_mall
+          - street_pedestrian
+          - street_traffic
+          - tram
+
+ckpt_path: /home/work/test/dcase25_kd/log/tfsepnet_kd/version_2/checkpoints/epoch=146-val_acc=0.5097.ckpt # Path to the checkpoint file
+
+model:
+  class_path: model.lit_asc.LitAcousticSceneClassificationSystem
+  init_args:
+    backbone:
+      class_path: model.backbones.TFSepNet
+      init_args:
+        in_channels: 1
+        num_classes: 10
+        base_channels: 64
+        depth: 17
+    data_augmentation:
+      mix_up: null
+      mix_style: null
+      mir_aug: null
+      spec_aug: null
+    class_label: scene
+    domain_label: device
+    spec_extractor:
+      class_path: util.CpMel
+      init_args:
+        n_mels: 512
+    device_list: 
+      - a
+      - b
+      - c
+      - s1
+      - s2
+      - s3
+      - s4
+      - s5
+      - s6
+      - unknown
+
+data:
+  class_path: data.data_module.DCASEDataModule
+  init_args:
+    meta_dir: /home/work/test/meta/TAU-urban-acoustic-scenes-2025-mobile-evaluation/evaluation_setup
+    audio_dir: /home/work/test/audio/TAU-urban-acoustic-scenes-2025-mobile-evaluation
+    predict_subset: fold1_test
+    test_subset: fold1_test 
+    batch_size: 16
+    num_workers: 12
+    pin_memory: true
